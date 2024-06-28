@@ -1,0 +1,371 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: CloudFormation template with resources necessary to perform instance auto-restart on Outposts servers
+
+Parameters:
+  StackName:
+    Type: String
+    Description: "Name of the CloudFormation stack"
+  SourceOutpostId:
+    Type: String
+    Description: "ID of the source outpost"
+  NotificationEmail:
+    Type: String
+    Description: "Email address for SNS notifications"
+
+Resources:
+  KMSKey:
+    Type: AWS::KMS::Key
+    UpdateReplacePolicy: Delete
+    DeletionPolicy: Delete
+    Properties:
+      Description: 'KMS key for encrypting SNS topic data'
+      KeyPolicy:
+        Version: '2012-10-17'
+        Id: key-default-1
+        Statement:
+          - Sid: Allow administration of the key
+            Effect: Allow
+            Principal:
+              AWS: !Sub 'arn:${AWS::Partition}:iam::${AWS::AccountId}:root'
+            Action:
+              - 'kms:*'
+            Resource: '*'
+          - Sid: Allow Cloudwatch Alarms to use the key
+            Effect: Allow
+            Principal:
+              Service: cloudwatch.amazonaws.com
+            Action:
+              - kms:Encrypt
+              - kms:Decrypt
+              - kms:GenerateDataKey
+              - kms:DescribeKey
+              - logs:CreateLogGroup
+              - logs:CreateLogStream
+              - logs:PutLogEvents
+            Resource: '*'
+
+  KMSKeyAlias:
+    Type: AWS::KMS::Alias
+    Properties:
+      AliasName: !Sub 'alias/${AWS::StackName}-kmskey'
+      TargetKeyId: !Ref KMSKey
+
+  LambdaSNSTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      DisplayName: "Outpost Server Notification"
+      KmsMasterKeyId: !Ref KMSKey
+
+  EmailSNSTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      DisplayName: "Outpost Server Email Notification"
+      KmsMasterKeyId: !Ref KMSKey
+
+  EmailSNSTopicSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      Protocol: email
+      Endpoint: !Ref NotificationEmail
+      TopicArn: !Ref EmailSNSTopic
+
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: LambdaExecutionPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - cloudformation:DescribeStacks
+                  - cloudwatch:DescribeAlarmHistory
+                  - ec2:RunInstances
+                  - ec2:CreateTags
+                  - ec2:DescribeInstances
+                  - ec2:DescribeLaunchTemplates
+                  - elasticloadbalancing:DescribeTargetGroups
+                  - elasticloadbalancing:DescribeTargetHealth
+                  - elasticloadbalancing:RegisterTargets
+                  - elasticloadbalancing:DeregisterTargets
+                  - iam:PassRole
+                  - lambda:InvokeFunction
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                  - outposts:ListAssets
+                  - ssm:GetParameters
+                  - sts:GetCallerIdentity
+                  - sns:Publish
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - sns:Subscribe
+                  - sns:Unsubscribe
+                  - sns:Publish
+                Resource:
+                  - !Ref LambdaSNSTopic
+                  - !Ref EmailSNSTopic
+              - Effect: Allow
+                Action:
+                  - kms:Decrypt
+                  - kms:GenerateDataKey
+                Resource: !GetAtt KMSKey.Arn
+
+  LambdaFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Environment:
+        Variables:
+          STACK_NAME: !Ref StackName
+          SOURCE_OUTPOST_ID: !Ref SourceOutpostId
+          LAMBDA_SNS_TOPIC_ARN: !Ref LambdaSNSTopic
+          EMAIL_SNS_TOPIC_ARN: !Ref EmailSNSTopic
+
+      Code:
+        ZipFile: |
+          import os
+          import boto3
+          from botocore.exceptions import ClientError
+          
+          # Retrieve launch template IDs from CloudFormation stack
+          def get_launch_template_ids(stack_name):
+            cloudformation = boto3.client("cloudformation")
+            try:
+              stack_details = cloudformation.describe_stacks(StackName=stack_name)
+              outputs = stack_details["Stacks"][0]["Outputs"]
+              launch_template_ids = []
+              for output in outputs:
+                if output["OutputKey"].startswith("LaunchTemplateId"):
+                  launch_template_ids.append(output["OutputValue"])
+              if not launch_template_ids:
+                raise Exception(f"Launch template IDs not found in stack {stack_name}.")
+              return launch_template_ids
+            except Exception as e:
+              print(f"Error retrieving launch template IDs: {str(e)}")
+              return None
+          
+          # Update ALB if ALB exists on instances on the existing Outposts server
+          def update_alb_target_group(source_outpost_id, new_instance_ids):
+            ec2 = boto3.client('ec2')
+            elbv2 = boto3.client('elbv2')
+          
+            try:
+              # Find existing instances on the source Outposts server
+              outpost_arn = f"arn:aws:outposts:{ec2.meta.region_name}:{boto3.client('sts').get_caller_identity()['Account']}:outpost/{source_outpost_id}"
+              response = ec2.describe_instances(Filters=[{'Name': 'outpost-arn', 'Values': [outpost_arn]}])
+              existing_instances = [instance['InstanceId'] for reservation in response['Reservations'] for instance in reservation['Instances']]
+          
+              if not existing_instances:
+                return "No existing instances found on the Outpost."
+          
+              # Find target group for existing instances
+              target_groups = elbv2.describe_target_groups()
+              target_group_arn = None
+              for tg in target_groups['TargetGroups']:
+                health = elbv2.describe_target_health(TargetGroupArn=tg['TargetGroupArn'])
+                if any(target['Target']['Id'] in existing_instances for target in health['TargetHealthDescriptions']):
+                  target_group_arn = tg['TargetGroupArn']
+                  break
+          
+              if not target_group_arn:
+                return "No ALB target group was found for the existing Outpost instances."
+          
+              # Register new instances to the target group
+              elbv2.register_targets(
+                TargetGroupArn=target_group_arn,
+                Targets=[{'Id': id} for id in new_instance_ids]
+              )
+          
+              # Deregister old instances from the target group
+              elbv2.deregister_targets(
+                TargetGroupArn=target_group_arn,
+                Targets=[{'Id': id} for id in existing_instances]
+              )
+          
+              return f"New instances registered and old instances deregistered from target group {target_group_arn}"
+            except ClientError as e:
+              return f"Error updating ALB target group: {str(e)}"
+          
+          # Wait for newly launched instances to enter 'running' state
+          def wait_for_instances_running(instance_ids, max_attempts=30):
+            ec2 = boto3.client('ec2')
+            waiter = ec2.get_waiter('instance_running')
+            try:
+              print(f"Waiting for instances {instance_ids} to enter 'running' state")
+              waiter.wait(
+                InstanceIds=instance_ids,
+                WaiterConfig={
+                  'Delay': 15,
+                  'MaxAttempts': max_attempts
+                }
+              )
+              print(f"All instances are now in 'running' state")
+              return True
+            except WaiterError as e:
+              print(f"Not all instances are in 'running' state after {max_attempts} attempts: {e}")
+              return False
+          
+          # Main Lambda handler
+          def lambda_handler(event, context):
+              stack_name = os.getenv("STACK_NAME")
+              source_outpost_id = os.getenv("SOURCE_OUTPOST_ID")
+              lambda_sns_topic_arn = os.getenv("LAMBDA_SNS_TOPIC_ARN")
+              email_sns_topic_arn = os.getenv("EMAIL_SNS_TOPIC_ARN")
+          
+              print(f"Received event: {event}")
+              print(f"Stack Name: {stack_name}")
+              print(f"Outpost ID: {source_outpost_id}")
+              print(f"Lambda SNS Topic ARN: {lambda_sns_topic_arn}")
+              print(f"Email SNS Topic ARN: {email_sns_topic_arn}")
+          
+              # Check if this is a new alarm state
+              cloudwatch = boto3.client('cloudwatch')
+              alarm_name = f"OutpostDownAlarm-{stack_name}"
+          
+              try:
+                  alarm_history = cloudwatch.describe_alarm_history(
+                      AlarmName=alarm_name,
+                      HistoryItemType='StateUpdate',
+                      MaxRecords=2
+                  )
+          
+                  if len(alarm_history['AlarmHistoryItems']) >= 2:
+                      current_state = alarm_history['AlarmHistoryItems'][0]['HistorySummary']
+                      previous_state = alarm_history['AlarmHistoryItems'][1]['HistorySummary']
+          
+                      # Do not re-alarm if the Outposts server is already in alarm state
+                      if 'ALARM' in current_state and 'ALARM' in previous_state:
+                          print(f"Alarm {alarm_name} was already in ALARM state. Skipping action.")
+                          return
+              except ClientError as e:
+                  print(f"Error checking alarm history: {e}")
+          
+              instance_ids = []
+              alb_message = ""
+          
+              try:
+                  # Grab launch template IDs to prepare to launch
+                  launch_template_ids = get_launch_template_ids(stack_name)
+                  if not launch_template_ids:
+                    raise Exception("No launch template IDs found.")
+          
+                  print(f"Retrieved launch template IDs: {launch_template_ids}")
+                  ec2 = boto3.client("ec2")
+          
+                  # Launch an EC2 instance for every launch template ID provided
+                  for launch_template_id in launch_template_ids:
+                      try:
+                          print(f"Launching new instance with launch template ID: {launch_template_id}")
+                          launch_response = ec2.run_instances(
+                              LaunchTemplate={"LaunchTemplateId": launch_template_id},
+                              MinCount=1,
+                              MaxCount=1,
+                          )
+                          instance_id = launch_response["Instances"][0]["InstanceId"]
+                          instance_ids.append(instance_id)
+                          print(f"Launched instance: {instance_id}")
+                      except ClientError as e:
+                          print(f"Error launching instance with launch template ID {launch_template_id}: {e}")
+                          raise
+          
+                  print(f"Launching instances: {instance_ids}")
+          
+                  # Wait for instances to enter 'running' state
+                  if not wait_for_instances_running(instance_ids):
+                    raise Exception("Timeout waiting for instances to enter 'running' state")
+                  print(f"Instances are now in running state: {instance_ids}")
+          
+                  # Update ALB if ALB exists
+                  alb_message = update_alb_target_group(source_outpost_id, instance_ids)
+          
+                  # Send e-mail via SNS
+                  email_sns = boto3.client("sns")
+                  try:
+                      message = f"Outpost {source_outpost_id} is in alarm state. Instances have successfully begun re-launching: {', '.join(instance_ids)}. {alb_message} Instance status can be monitored on EC2."
+                      email_sns.publish(
+                          TopicArn=email_sns_topic_arn,
+                          Message=message,
+                          Subject="Outpost Instance Launch Success"
+                      )
+                      print(f"Published success message to SNS topic: {message}")
+                  except ClientError as e:
+                      print(f"Error publishing success message to SNS topic: {e}")
+                      raise
+
+              except Exception as e:
+                  print(f"Error in lambda_handler: {str(e)}")
+          
+                  email_sns = boto3.client("sns")
+                  try:
+                      if instance_ids:
+                        message_intro = f"Outpost {source_outpost_id} is in alarm state. Instance re-launch was attempted but failed with error below, though the following instances were successfully launched: {instance_ids}."
+                      else:
+                        message_intro = f"Outpost {source_outpost_id} is in alarm state. Instance re-launch was attempted but failed with error:"
+                      message = f"""{message_intro}
+          
+          {str(e)}
+
+          Please manually resolve and re-launch.
+
+          Note: In the case of insufficient capacity, the instances may have successfully relaunched but are not associated with an Outpost."""
+                      email_sns.publish(
+                          TopicArn=email_sns_topic_arn,
+                          Message=message,
+                          Subject="Outpost Instance Launch Failure"
+                      )
+                      print(f"Published error message to SNS topic: {message}")
+                  except ClientError as e:
+                      print(f"Error publishing error message to SNS topic: {e}")
+                      raise
+
+      Runtime: python3.8
+      Timeout: 450 # Set timeout to 450 seconds (7.5 min)
+
+  LambdaInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref LambdaFunction
+      Principal: sns.amazonaws.com
+      SourceArn: !Ref LambdaSNSTopic
+
+  LambdaSNSTopicSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      Protocol: lambda
+      Endpoint: !GetAtt LambdaFunction.Arn
+      TopicArn: !Ref LambdaSNSTopic
+
+  ConnectedStatusAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: "Alarm when Outpost is down. Failure means ConnectedStatus is less than 1 for 3 datapoints within 3 minutes"
+      AlarmName: !Sub "OutpostDownAlarm-${AWS::StackName}"
+      Namespace: "AWS/Outposts"
+      MetricName: "ConnectedStatus"
+      Dimensions:
+        - Name: "OutpostId"
+          Value: !Ref SourceOutpostId
+      Statistic: "Average"
+      Period: 60
+      EvaluationPeriods: 3
+      DatapointsToAlarm: 3
+      Threshold: 1
+      ComparisonOperator: "LessThanThreshold"
+      AlarmActions:
+        - !Ref LambdaSNSTopic
+
+Outputs:
+# Outputs will be dynamically inserted here
