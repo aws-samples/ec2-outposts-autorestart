@@ -385,7 +385,7 @@ Resources:
                       raise
 
       Runtime: python3.8
-      Timeout: 450 # Set timeout to 450 seconds (7.5 min)
+      Timeout: 900 # Set timeout 15 minutes
 
   LambdaInvokePermission:
     Type: AWS::Lambda::Permission
