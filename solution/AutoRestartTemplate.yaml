@@ -30,7 +30,7 @@ Resources:
             Action:
               - 'kms:*'
             Resource: '*'
-          - Sid: Allow Cloudwatch Alarms to use the key
+          - Sid: Allow Cloudwatch to use the key
             Effect: Allow
             Principal:
               Service: cloudwatch.amazonaws.com
@@ -39,9 +39,17 @@ Resources:
               - kms:Decrypt
               - kms:GenerateDataKey
               - kms:DescribeKey
-              - logs:CreateLogGroup
-              - logs:CreateLogStream
-              - logs:PutLogEvents
+            Resource: '*'
+          - Sid: Allow Cloudwatch Logs to use the key
+            Effect: Allow
+            Principal:
+              Service: logs.amazonaws.com
+            Action:
+              - kms:Encrypt
+              - kms:Decrypt
+              - kms:ReEncrypt*
+              - kms:GenerateDataKey*
+              - kms:DescribeKey
             Resource: '*'
 
   KMSKeyAlias:
@@ -80,46 +88,77 @@ Resources:
               Service:
                 - lambda.amazonaws.com
             Action: sts:AssumeRole
-      Policies:
-        - PolicyName: LambdaExecutionPolicy
-          PolicyDocument:
-            Version: '2012-10-17'
-            Statement:
-              - Effect: Allow
-                Action:
-                  - cloudformation:DescribeStacks
-                  - cloudwatch:DescribeAlarmHistory
-                  - ec2:RunInstances
-                  - ec2:CreateTags
-                  - ec2:DescribeInstances
-                  - ec2:DescribeLaunchTemplates
-                  - elasticloadbalancing:DescribeTargetGroups
-                  - elasticloadbalancing:DescribeTargetHealth
-                  - elasticloadbalancing:RegisterTargets
-                  - elasticloadbalancing:DeregisterTargets
-                  - iam:PassRole
-                  - lambda:InvokeFunction
-                  - logs:CreateLogGroup
-                  - logs:CreateLogStream
-                  - logs:PutLogEvents
-                  - outposts:ListAssets
-                  - ssm:GetParameters
-                  - sts:GetCallerIdentity
-                  - sns:Publish
-                Resource: '*'
-              - Effect: Allow
-                Action:
-                  - sns:Subscribe
-                  - sns:Unsubscribe
-                  - sns:Publish
-                Resource:
-                  - !Ref LambdaSNSTopic
-                  - !Ref EmailSNSTopic
-              - Effect: Allow
-                Action:
-                  - kms:Decrypt
-                  - kms:GenerateDataKey
-                Resource: !GetAtt KMSKey.Arn
+
+  LambdaExecutionPolicy:
+    Type: AWS::IAM::Policy
+    DependsOn: LambdaFunction
+    Properties:
+      PolicyName: LambdaExecutionPolicy
+      Roles:
+        - !Ref LambdaExecutionRole
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Action:
+              - cloudformation:DescribeStacks
+            Resource: !Sub 'arn:aws:cloudformation:${AWS::Region}:${AWS::AccountId}:stack/${AWS::StackName}/*'
+          - Effect: Allow
+            Action:
+              - cloudwatch:DescribeAlarmHistory
+            Resource: !Sub 'arn:aws:cloudwatch:${AWS::Region}:${AWS::AccountId}:alarm:OutpostDownAlarm-${AWS::StackName}'
+          - Effect: Allow
+            Action:
+              - ec2:RunInstances
+              - ec2:CreateTags
+              - ec2:DescribeInstances
+              - ec2:DescribeLaunchTemplates
+            Resource: '*'
+          - Effect: Allow
+            Action:
+              - elasticloadbalancing:DescribeTargetGroups
+              - elasticloadbalancing:DescribeTargetHealth
+            Resource: '*'
+          - Effect: Allow
+            Action:
+              - elasticloadbalancing:RegisterTargets
+              - elasticloadbalancing:DeregisterTargets
+            Resource: !Sub 'arn:aws:elasticloadbalancing:${AWS::Region}:${AWS::AccountId}:targetgroup/*/*'
+          - Effect: Allow
+            Action:
+              - lambda:InvokeFunction
+            Resource: !GetAtt LambdaFunction.Arn
+          - Effect: Allow
+            Action:
+              - logs:CreateLogGroup
+              - logs:CreateLogStream
+              - logs:PutLogEvents
+            Resource: !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:*'
+          - Effect: Allow
+            Action:
+              - outposts:ListAssets
+            Resource: !Sub 'arn:aws:outposts:${AWS::Region}:${AWS::AccountId}:outpost/${SourceOutpostId}'
+          - Effect: Allow
+            Action:
+              - ssm:GetParameters
+            Resource: !Sub 'arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/*'
+          - Effect: Allow
+            Action:
+              - sts:GetCallerIdentity
+            Resource: !Sub 'arn:aws:sts::${AWS::AccountId}:assumed-role/${AWS::StackName}-LambdaExecutionRole/*'
+          - Effect: Allow
+            Action:
+              - sns:Publish
+              - sns:Subscribe
+              - sns:Unsubscribe
+            Resource:
+              - !Ref LambdaSNSTopic
+              - !Ref EmailSNSTopic
+          - Effect: Allow
+            Action:
+              - kms:Decrypt
+              - kms:GenerateDataKey
+            Resource: !GetAtt KMSKey.Arn
 
   LambdaFunction:
     Type: AWS::Lambda::Function
@@ -137,7 +176,7 @@ Resources:
         ZipFile: |
           import os
           import boto3
-          from botocore.exceptions import ClientError
+          from botocore.exceptions import ClientError, WaiterError
           
           # Retrieve launch template IDs from CloudFormation stack
           def get_launch_template_ids(stack_name):
@@ -160,41 +199,56 @@ Resources:
           def update_alb_target_group(source_outpost_id, new_instance_ids):
             ec2 = boto3.client('ec2')
             elbv2 = boto3.client('elbv2')
-          
+        
             try:
-              # Find existing instances on the source Outposts server
-              outpost_arn = f"arn:aws:outposts:{ec2.meta.region_name}:{boto3.client('sts').get_caller_identity()['Account']}:outpost/{source_outpost_id}"
-              response = ec2.describe_instances(Filters=[{'Name': 'outpost-arn', 'Values': [outpost_arn]}])
-              existing_instances = [instance['InstanceId'] for reservation in response['Reservations'] for instance in reservation['Instances']]
-          
-              if not existing_instances:
-                return "No existing instances found on the Outpost."
-          
-              # Find target group for existing instances
+              # Find target group for Outpost instances
               target_groups = elbv2.describe_target_groups()
               target_group_arn = None
+              existing_instances = []
+        
               for tg in target_groups['TargetGroups']:
                 health = elbv2.describe_target_health(TargetGroupArn=tg['TargetGroupArn'])
-                if any(target['Target']['Id'] in existing_instances for target in health['TargetHealthDescriptions']):
+                tg_instances = [target['Target']['Id'] for target in health['TargetHealthDescriptions']]
+                
+                # Check if any of these instances are on our Outpost
+                outpost_arn = f"arn:aws:outposts:{ec2.meta.region_name}:{boto3.client('sts').get_caller_identity()['Account']}:outpost/{source_outpost_id}"
+                response = ec2.describe_instances(InstanceIds=tg_instances, Filters=[{'Name': 'outpost-arn', 'Values': [outpost_arn]}])
+        
+                if response['Reservations']:
                   target_group_arn = tg['TargetGroupArn']
+                  existing_instances = [instance['InstanceId'] for reservation in response['Reservations'] for instance in reservation['Instances']]
                   break
-          
+        
               if not target_group_arn:
-                return "No ALB target group was found for the existing Outpost instances."
-          
+                return "No ALB target group was found for the Outpost instances."
+        
+              print(f"Found target group: {target_group_arn}")
+              print(f"Existing instances in target group: {existing_instances}")
+        
               # Register new instances to the target group
-              elbv2.register_targets(
-                TargetGroupArn=target_group_arn,
-                Targets=[{'Id': id} for id in new_instance_ids]
-              )
-          
+              if new_instance_ids:
+                  print(f"Attempting to register new instances: {new_instance_ids}")
+                  elbv2.register_targets(
+                      TargetGroupArn=target_group_arn,
+                      Targets=[{'Id': id} for id in new_instance_ids]
+                  )
+                  print(f"Successfully registered new instances: {new_instance_ids}")
+        
               # Deregister old instances from the target group
-              elbv2.deregister_targets(
-                TargetGroupArn=target_group_arn,
-                Targets=[{'Id': id} for id in existing_instances]
-              )
-          
-              return f"New instances registered and old instances deregistered from target group {target_group_arn}"
+              if existing_instances:
+                  print(f"Attempting to deregister old instances: {existing_instances}")
+                  elbv2.deregister_targets(
+                      TargetGroupArn=target_group_arn,
+                      Targets=[{'Id': id} for id in existing_instances]
+                  )
+                  print(f"Successfully deregistering old instances: {existing_instances}")
+        
+              # Verify the current state of the target group
+              current_health = elbv2.describe_target_health(TargetGroupArn=target_group_arn)
+              current_instances = [target['Target']['Id'] for target in current_health['TargetHealthDescriptions']]
+              print(f"Current instances in target group: {current_instances}")
+        
+              return f"New instances registered and old instances deregistered from target group {target_group_arn}. Current instances: {current_instances}"
             except ClientError as e:
               return f"Error updating ALB target group: {str(e)}"
           
@@ -247,7 +301,7 @@ Resources:
           
                       # Do not re-alarm if the Outposts server is already in alarm state
                       if 'ALARM' in current_state and 'ALARM' in previous_state:
-                          print(f"Alarm {alarm_name} was already in ALARM state. Skipping action.")
+                          print(f"Alarm {alarm_name} is already in ALARM state. Skipping action.")
                           return
               except ClientError as e:
                   print(f"Error checking alarm history: {e}")
@@ -368,4 +422,4 @@ Resources:
         - !Ref LambdaSNSTopic
 
 Outputs:
-# Outputs will be dynamically inserted here
+  # Outputs will be dynamically inserted here
