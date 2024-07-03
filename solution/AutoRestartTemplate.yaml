@@ -248,7 +248,7 @@ Resources:
               current_instances = [target['Target']['Id'] for target in current_health['TargetHealthDescriptions']]
               print(f"Current instances in target group: {current_instances}")
         
-              return f"New instances registered and old instances deregistered from target group {target_group_arn}. Current instances: {current_instances}"
+              return f"New instances registered and old instances deregistered from target group {target_group_arn}. Current instances: {current_instances}."
             except ClientError as e:
               return f"Error updating ALB target group: {str(e)}"
           
