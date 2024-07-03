@@ -1,11 +1,8 @@
-## My Project
+## EC2 Auto-Relaunch Tool on Outposts Server
 
-TODO: Fill this README out!
+This repository contains a tool that will set up infrastructure on your AWS account to allow for automatic re-launch of EC2 instances in the case of Outposts server hardware failure.
 
-Be sure to:
-
-* Change the title in this README
-* Edit your repository description on GitHub
+Please refer to this [blogpost]() for more details alongside a step-by-step guide on how to execute this tool.
 
 ## Security
 
