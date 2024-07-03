@@ -210,7 +210,7 @@ Resources:
                 health = elbv2.describe_target_health(TargetGroupArn=tg['TargetGroupArn'])
                 tg_instances = [target['Target']['Id'] for target in health['TargetHealthDescriptions']]
                 
-                # Check if any of these instances are on our Outpost
+                # Check if any of the instances in the target group are also on the Outpost
                 outpost_arn = f"arn:aws:outposts:{ec2.meta.region_name}:{boto3.client('sts').get_caller_identity()['Account']}:outpost/{source_outpost_id}"
                 response = ec2.describe_instances(InstanceIds=tg_instances, Filters=[{'Name': 'outpost-arn', 'Values': [outpost_arn]}])
         
