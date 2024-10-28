@@ -2,7 +2,7 @@
 
 This repository contains a tool that will set up infrastructure on your AWS account to allow for automatic re-launch of EC2 instances in the case of Outposts server hardware failure.
 
-Please refer to this [blogpost]() for more details alongside a step-by-step guide on how to execute this tool.
+Please refer to this [blogpost](https://aws.amazon.com/blogs/compute/enabling-high-availability-of-amazon-ec2-instances-on-aws-outposts-servers-part-2/) for more details alongside a step-by-step guide on how to execute this tool.
 
 ## Security
 
